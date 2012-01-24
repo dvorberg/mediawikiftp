@@ -1,0 +1,54 @@
+mediawikiftp
+============
+
+Copyright (C) 2007 Diedrich Vorberg <diedrich@tux4web.de>
+Portions Copyright (C) 2005 - 2006 Mathieu Blondel
+     from the WikipediaFS project.
+
+About
+-----
+     
+This program is meant as a drop in replacement for your command line
+ftp client when used by Emacs to transparently access FTP
+servers. When used with a custom, non ftp, port it will emulate an FTP
+server and client that makes Emacs think your Media Wiki site is an
+FTP server with your Wiki Articles as files. Otherwise it will pass
+control to your regular FTP client allowing you to use it regularly.
+
+
+Requirements and Installation
+-----------------------------
+
+Mediawikiftp works with a vanilla Python installation version 2.3 or
+better. To install just copy it to a directory on your $PATH. Make
+sure it's executable. To configure it in Emacs add this to your .emacs
+file:
+
+(custom-set-variables
+  ;; custom-set-variables was added by Custom.
+  ;; If you edit it by hand, you could mess it up, so be careful.
+  ;; Your init file should contain only one such instance.
+  ;; If there is more than one, they won't work right.
+ '(ange-ftp-ftp-program-name "/path/to/mediawikiftp"))
+
+Or use
+
+   M-x customize-group RET ange-ftp
+
+to do so automatically.
+
+TODO
+----
+
+- The BASE AUTH and Proxy functionality remains untested right now.
+- There's probably half a ton of bugs in there
+- Add more and better comments
+
+Please don't hesitate to write for help or with any kind of problem or
+idea to Diedrich Vorberg <diedrich@tux4web.de>.
+
+
+.. $Log: README,v $
+.. Revision 1.1  2007/08/14 20:50:51  t4w00-diedrich
+.. Initial commit.
+..     

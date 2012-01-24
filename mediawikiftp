@@ -1,0 +1,1009 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# mediawikiftp
+#
+# Copyright (C) 2007 Diedrich Vorberg <diedrich@tux4web.de>
+# Portions Copyright (C) 2005 - 2006 Mathieu Blondel
+#      from the WikipediaFS project.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+"""\
+This program emulates an FTP command line client to allow access to a
+Media Wiki.
+
+All options are optional and default to suitable values to perform
+anonymous oprtaions.
+
+Usage: %prog [options] [host] [port]
+
+The HOST must be a regular hostname. The directory the wiki resides in
+and 'index.php' (the name is hard-wired, sorry) must be passed like a
+path by cd'ing into it. If you want to use this program to talk to a
+wiki, you must specify a custum port (in most cases port 80) either on
+the command line or the open command. With Ange-FTP in Emacs use this
+syntax:
+
+   /ftp:username@host#80:/wiki_dir/index.php/Something
+
+If you do not specify a port, port 21 will be assumed and, as for all
+ports inding in 21, controll will be handed to a regular ftp client to
+handle the connection. This program is specifically designed to work
+with emacs and handles the subset of ftp's functionality that Ange-FTP
+uses well. Everything else is pretty much left out. If you want to
+specify mediawikiftp specific command lines, just add them to the
+appropriate Ange-FTP configuration variable. All long options
+(starting with --) will be ignored when passed to regular ftp if
+controll is passed to it. Passing controll to regular ftp does not
+bring about any loss in its performance.
+
+The 'ftp server' will always report Jan 1st, 1970 as file date, for
+all files. Your wiki directory will contain one 'directory' named
+index.php. Please note that renaming index.php into something else
+breaks this program! You wiki entries are in that directory. 
+"""
+
+
+
+#
+# $Log: mediawikiftp,v $
+# Revision 1.2  2007/08/30 13:40:00  t4w00-diedrich
+# Port is now passwd by the connect command.
+#
+# Revision 1.1.1.1  2007/08/14 20:22:05  t4w00-diedrich
+#
+#
+#
+
+__version__ = "$Revision"[11:-2]
+
+import sys, os, os.path, re, socket
+import httplib, urllib, base64, time
+from string import *
+from types import *
+from getpass import getpass
+import optparse
+from sgmllib import SGMLParser
+
+class debug_file:
+    def __init__(self, fp):
+        self.fp = fp
+
+    def write(self, s):
+        if self.fp is not None:
+            self.fp.write(s)
+            self.fp.flush()
+
+    def flush(self):
+        if self.fp is not None:
+            self.fp.flush()
+
+debug = debug_file(None) # open("/tmp/mediawikiftp.log", "a")
+
+class tee:
+    def __init__(self, fp):
+        self.fp = fp
+
+    def write(self, s):
+        self.fp.write(s)
+        self.fp.flush()
+
+        debug.write(s)
+        debug.flush()
+
+class HttpException(Exception): pass
+
+class article(SGMLParser):
+    """
+    This class mainly deals with getting and setting an article.
+    """
+    # This is where I most heavily borrowed from Mathieu Blondel's
+    # WikipediaFS (v.0.1).
+    
+    def __init__(self, wiki_backend, article_name):
+        """
+        A WikipediaArticle is defined by its name and
+        the WikipediaArticleList it belongs to.
+        Moreover, a WikipediaArticle has its own content,
+        wpEdittime, edit_page and submit_page.
+        """        
+        # logger.info("article_name " + repr(article_name))
+
+        SGMLParser.__init__(self)
+    
+        self.name = article_name
+        self.content = ""
+        self.textarea = False
+        self.wpEdittime = 0
+        self.wpEditToken = None
+        self.last_open_time = 0
+
+        self.site = wiki_backend
+        
+
+    def start_textarea(self, attrs):
+        """
+        Called when a textarea is entered.
+        """
+        self.textarea = True
+    
+    def start_input(self, attrs):
+        """
+        Called when an input is entered.
+        """
+        # To set an article, we need to now its wpEdittime first.
+        
+        if len(attrs) == 3 and attrs[2][1] == "wpEdittime":
+            self.wpEdittime = attrs[1][1]
+        elif len(attrs) == 3 and attrs[2][1] == "wpEditToken":
+            self.wpEditToken = attrs[1][1]            
+            
+    def end_textarea(self):
+        """
+        Called when a textarea is left.
+        """
+        self.textarea = False
+        
+    def handle_data(self,data):
+        """
+        Called when data is parsed.
+        """            
+        # We add the parsed data to self.content when the data parsed
+        # is in a textarea.
+        if self.textarea:
+            self.content += data
+
+    def get(self): 
+        """
+        Gets the wiki content (not the whole html page).
+        """
+        response = self.site.get(self.name, "edit")
+        
+        # Feeds the SGMLparser
+        data = response.read()
+        print >> debug, "Received %i bytes edit page" % len(data)
+        print >> debug, "response.status =", response.status
+        self.feed(data)
+        
+        content = self.content
+        # We delete it not to keep content in memory
+        self.content = ""
+
+        print >> debug, "Received %i bytes textarea" % len(content)
+        
+        # Returns content that has been updated by the handle_data method
+        return content
+                      
+        
+    def put(self, article_data):
+        """ 
+        Sets the wiki content of the article.
+        """
+        # Looking for a [[Summary:*]]
+        regexp = '((\[\[)((s|S)ummary:)(.*)(\]\])(( )*\n)?)'
+        summary = re.search(regexp, article_data)
+        if summary is not None:
+            wpSummary = summary.group(5)
+            article_data = article_data.replace(summary.group(1), '')
+        else:
+            wpSummary = ""
+       
+        # wpEdittime is empty if the article is a new article
+        params = { "wpTextbox1": article_data, "wpSummary": wpSummary, 
+                   "wpEdittime": self.wpEdittime, "wpSave": 1 }
+        
+        # Needed for logged in edition
+        if self.wpEditToken is not None:
+            params["wpEditToken"] = self.wpEditToken
+
+        response = self.site.post(self.name, "submit", {}, params)
+        
+class wiki_backend:
+    def __init__(self,
+                 host=None,
+                 port="21",
+                 wiki_user=None, wiki_password=None,
+                 http_user=None, http_password=None,
+                 proxy_host=None, proxy_user=None, proxy_password=None):
+        self.host = host
+        self.port = port
+        self.wiki_user = wiki_user
+        self.wiki_password = wiki_password
+        self.http_user = http_user
+        self.http_password = http_password
+        self.proxy_host = proxy_host
+        self.proxy_user = proxy_user
+        self.proxy_password = proxy_password
+
+        self._conn = None
+        self.cookie_string = None
+
+        self._confirmed_wikis = []
+        
+        self._article_cache = {} # The articles dict maps (basname, title,)
+                                 # tuples to article instances.
+        
+    def connect(self):
+        self.conn()
+
+    def close(self):
+        self.host = None
+        self.port = "21"
+        self.wiki_user = None
+        self.wiki_password = None
+        self.cookie_string = None
+        
+        self._conn = None
+
+    def connected(self):
+        return self._conn is not None
+
+    def __repr__(self):
+        ret = []
+        for a in dir(self):
+            v = getattr(self, a)
+            if type(v) == StringType or v is None:
+                ret.append("%s=%s" % ( a, repr(v), ))
+
+        return join(ret, ", ")
+        
+    in_cookie_re = re.compile(': (.*?);')
+    def login(self):
+        """
+        Log into the wiki and set self.cookie_string.
+        """
+        if self.cookie_string is not None: return
+        
+        params = {"wpName": self.wiki_user,
+                  "wpPassword": self.wiki_password,
+                  "wpLoginattempt": "Identification", "wpRemember":"1"}
+        
+        response = self.post("Special:Userlogin", "submit",
+                             get_params={"returnto": "Special:Userlogin"},
+                             post_params=params)
+
+        cookie_list = []
+        
+        for cookie_value in response.msg.getallmatchingheaders("set-cookie"):
+            it_matches = self.in_cookie_re.search(cookie_value)
+            
+            if it_matches:
+                cookie_list.append(it_matches.group(1))
+
+        if len(cookie_list) == 4:
+            cookie_list.pop()
+            self.cookie_string = "; ".join(cookie_list)
+        else:
+            raise Exception("Login to %s as %s failed!" % (
+                    self.host, self.wiki_user, ))
+
+    def check_for_wiki(self, strict=False):
+        """
+        @param strict: True indicates that the path must end in a .php file.
+        
+        Check if the current cwd on the webserver contains a
+        mediawiki index.php.
+        """
+        if strict and not \
+                (len(self.ftp_frontend.remote_path) > 0 and \
+                     self.ftp_frontend.remote_path[-1].endswith(".php")):
+            return False
+                
+        if self.basename() in self._confirmed_wikis:
+            return True
+        else:
+            try:
+                print >> debug, "Checking for wiki..."
+                response = self.get("", "an-action-that-does-not-exist")
+                data = response.read()
+                print >> debug, "Received %i bytes while checking for wiki" % len(data)
+                                
+                if "Debug output:" in data: # Mediawiki puts this in the page
+                    self._confirmed_wikis.append(self.basename())
+                    return True             # that says "This action doesn't
+                                            # exist..."
+                else:
+                    return False
+            except HttpException:
+                return False
+        
+                            
+    class response_wrapper:
+        def __init__(self, response):
+            self.data = response.read()
+            self.status = response.status
+            self.msg = response.msg
+            self.reason = strip(response.reason)
+
+        def __str__(self):
+            return self.data
+
+        def read(self, dumm=None):
+            return self.data
+
+    def request(self, method, title, action, get_params={}, post_params={},
+                url=None):
+        """
+        Make a post request to the wiki site.
+        """
+        if title: get_params["title"] = title
+        if action: get_params["action"] = action
+
+        get_params = urllib.urlencode(get_params)        
+        post_params = urllib.urlencode(post_params)
+        
+        headers = {"Content-type": "application/x-www-form-urlencoded",
+                   "User-agent" : "WikipediaFS", "Host": self.host, }
+
+        # We are logged in and need to pass the cookie for authentication
+        if self.cookie_string is not None:
+            headers["Cookie"] = self.cookie_string
+
+        # If Basic http authentication credentials are supplied,
+        # add an appropriate header. Digest authentication could be
+        # added easily.
+
+        if self.http_user and self.http_password:
+            auth = 'Basic ' + strip(base64.encodestring(
+                self.http_user + ':' + self.http_password))
+            headers["Authorization"] = auth
+      
+        # The url
+        if url is None:
+            url = "%(basename)s?%(get_params)s" % {
+                "basename": self.basename(),
+                "get_params": get_params, }
+
+        print >> debug, "HTTP!", method, url, repr(headers),
+            
+        try:
+            conn = self.conn()
+            conn.request(method, url, post_params, headers)
+            response = conn.getresponse()
+        except ( httplib.HTTPException, socket.error, ):
+            self._conn = None
+            conn = self.conn()
+            conn.request(method, url, post_params, headers)
+            response = conn.getresponse()
+
+        print >> debug, "response status =", response.status
+            
+        # The response_wrapper is needed to make sure that all data
+        # is read from the connection before a new request is issued.
+        ret = self.response_wrapper(response)
+        
+        if response.status == 200:
+            return ret
+        elif response.status == 302:
+            if "returnto=" in get_params:
+                # This is done mostly for the login page, which
+                # redirects on login success. Yet this redirection
+                # is not understood by login() if executed here.
+                return ret            
+            else:
+                location = response.getheader('location')
+
+                print >> debug, "location", location
+
+                if location == url:
+                    return ret
+                else:
+                    return self.request(method, title, action,
+                                        get_params={}, post_params={},
+                                        url = location)
+            
+        elif response.status == 301:
+            location = response.getheader("location")
+            
+            if location is None:
+                raise Exception("Moved permanently but no location")
+            else:
+                # Non-English Mediawiki installation will forward you
+                # to their own "Special" etc. pages.
+                return self.request(method, title, action,
+                                    get_params={}, post_params={},
+                                    url = location)
+        else:
+            raise HttpException(
+                "Failed http request to wiki %s as %s: %i %s %s %s" % (
+                    repr(self.host), repr(self.wiki_user),
+                    response.status, repr(response.reason),
+                    repr(method), repr(url),))
+
+        
+    def post(self, title, action, get_params={}, post_params={}):
+        return self.request("POST", title, action, get_params, post_params)
+
+    def get(self, title, action, **params):
+        return self.request("GET", title, action, params)
+
+    def conn(self):
+        if self._conn is None:
+            # Make connection
+            conn = httplib.HTTPConnection(self.host, int(self.port))
+
+            # Proxy settings
+            if self.proxy_host is not None:                
+                http_proxy = self.proxy_host                
+                http_proxy = replace("http://", "").rstrip("/")
+                if ":" in http_proxy:
+                    (proxy_host, proxy_port) = http_proxy.split(":")
+                else:
+                    proxy_host = http_proxy
+                    proxy_port = 80
+        
+                proxy_port = int(proxy_port)
+                proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                proxy_sock.connect((proxy_host, proxy_port))
+                conn.sock = proxy_sock
+
+            self._conn = conn
+
+        return self._conn
+
+    def basename(self):
+        path = self.ftp_frontend.remote_path[:]
+
+        # Chop of any element that starts with a + in the basename.
+        for counter, dir in enumerate(path):
+            if len(dir) > 0 and dir[0] == "+":
+                path = path[:counter]
+                break
+            
+        return "/" + join(path, "/")
+
+    def get_article(self, title):
+        self.login()
+        a = article(self, title)
+        self._article_cache[(self.basename(), title,)] = a
+        return a.get()
+
+    def put_article(self, title, article_data):
+        self.login()
+        if not self._article_cache.has_key((self.basename(), title,)):
+             self.get_article(title)
+             
+        self._article_cache[(self.basename(), title,)].put(article_data)
+
+class unbuffered:
+    def __init__(self, fp):
+        self.fp = fp
+
+    def write(self, s):
+        self.fp.write(s)
+        self.fp.flush()
+
+    def flush(self):
+        self.fp.flush()
+        
+class command:
+    """
+        Baseclass for all commands.
+
+        @cvar arg_spec: A tuple of tuples as ( name, default, required, )
+        """
+    arg_spec = ()
+
+    def __init__(self, ftp_frontend, args):
+        self.ftp_frontend = ftp_frontend
+        self.conn = ftp_frontend.conn
+        self.out = ftp_frontend.out
+
+        counter = 0
+        for name, default, required in self.arg_spec:
+            if len(args) >= counter + 1:
+                value = args[counter]
+            else:
+                if required:
+                    value = ftp_frontend.ask("(%s)" % name.replace("_", "-"))
+                else:
+                    value = default
+
+            setattr(self, name, value)
+            counter += 1
+
+    def run(self):
+        pass
+
+    def check_args(self):
+        for name, default, required in self.arg_spec:
+            value = getattr(self, name)
+            if required and value is None or value == "":
+                return False
+
+        return True
+
+    def usage(self):
+        args = []
+        for name, default, required in self.arg_spec:
+            if required:
+                args.append(name.replace("_", "-"))
+            else:
+                args.append("(%s)" % name.replace("_", "-"))
+
+        return self.__class__.__name__ + " " + join(args, " ")
+
+class remote_file_command(command):
+    def __init__(self, ftp_frontend, args):
+        command.__init__(self, ftp_frontend, args)
+        if not hasattr(self, "remote_file") or self.remote_file is None:
+            return
+        else:
+            parts = split(self.remote_file, "/")
+            parts = filter(lambda s: s != "", parts)
+            if self.remote_file.startswith("/"):
+                self.ftp_frontend.remote_path = parts[:-1]
+            else:
+                self.ftp_frontend.remote_path += parts[:-1]
+
+            self.remote_file = parts[-1]
+
+
+class ftp_frontend:
+    """
+    The emulates an FTP client and server as a frontend for wiki_backend.
+    """
+    def __init__(self, wiki_backend):
+        wiki_backend.ftp_frontend = self
+        
+        self.conn = wiki_backend
+        self.out = tee(sys.stdout)
+        self.input = sys.stdin
+
+        self.remote_path = [] # List that represents the current 'path'
+                              # We need this to accquire webserver path
+                              # and filename info for index.php.
+        
+    def run(self):
+        if self.conn.host is not None:
+            self.connect(self, [self.conn.host, self.conn.port]).run()
+
+        while True:
+            try:
+                words = self.ask()
+                if len(words) > 0:
+                    cmd = words[0]
+                    args = words[1:]
+                
+                    cmd = lower(cmd)
+                    if len(cmd) > 4: cmd = cmd[:4]
+
+                    # Create a command instance from a command class
+                    cmd_cls = getattr(self, cmd, None)
+                    if cmd_cls is None:
+                        print >> self.out, "Unknown command", cmd
+                    else:
+                        cmd_inst = cmd_cls(self, args)
+
+                        if cmd_inst.check_args():
+                            # And run the run() method.
+                            cmd_inst.run()
+                        else:
+                            print >> self.out, "Usage:", cmd_inst.usage()
+            except KeyboardInterrupt:
+                print >> self.out
+                pass
+
+    word_re = re.compile('"(.*)"|(\S+)')
+    def ask(self, question=None, default=None, no_echo=False):
+        """
+        @params question: Question string echoed to the user
+        @params default: Default value. If supplied it will be echoed as
+           well, set in paranthesis.
+        @param no_echo: Boolean indicating whether user input shall be
+           echoed to the terminal. Suppressable for passwords.
+        """
+        if question is not None:
+            self.out.write(question)
+            if default is not None:
+                self.out.write(" (%s)" % default)
+            if question[0] != "(":
+                self.out.write(": ")
+            else:
+                self.out.write(" ")
+        else:
+            self.out.write("ftp> ")
+
+        if no_echo:
+            input = getpass("")
+        else:
+            input = ""
+            while True:
+                byte = self.input.read(1)
+                if byte == "": sys.exit(0) # ^D
+                if byte != "\n":
+                    input += byte
+                else:
+                    break
+
+            print >> debug, "received:", repr(input)
+                
+            input = strip(input)
+
+        if question is not None:
+            if default is not None and input == "":
+                return default
+            else:
+                return input
+        else:
+            input = input.replace(r"\ ", "\0")
+            words = self.word_re.findall(input)
+            words = map(lambda tpl: join(tpl, ""), words)
+            words = map(lambda word: word.replace("\0", " "), words)
+            words = map(lambda word: word.replace("\\", ""), words)
+
+            print >> debug, "words", repr(words)
+            
+            return words
+
+
+        
+    # Commands
+    class bye(command):        
+        """
+        The simplest command first: Quit terminates this 'FTP' process.
+        """
+        def run(self):
+            print "221 Goodbye."
+            sys.exit(0)
+    quit = bye
+    exit = bye
+    
+    class connect(command):
+        arg_spec = ( ("to", None, True,),
+                     ("port", "21", False,), )
+
+        def run(self):
+            self.port = int(self.port)
+
+            if self.port % 100 == 21:
+                # If we're supposed to work on a port whoes number ends in '21'
+                # we pass conroll to regular ftp.
+                args = ["/usr/bin/ftp"]                
+                for a in sys.argv[1:]:
+                    if a.startswith("-") and not a.startswith("--"):
+                        args.append(a)
+                args.append(self.to)
+                args.append(str(self.port))
+
+                # This is the end of this process' life, RIP.
+                os.execv("/usr/bin/ftp", args) 
+            
+            if self.conn.connected():
+                print >> self.out, \
+                    "Already connected to %s, use close first." % (
+                    self.conn.host, )
+            else:
+                self.conn.host = self.to
+                self.conn.port = self.port
+                
+                print >> self.out, "Connected to", self.to
+                print >> self.out, \
+                    "220 %s FTP server (mediawikiftp %s) ready." % (
+                    self.to, __version__, )
+
+            self.conn.connect()
+            
+    open = connect
+    ftp = connect
+
+    class user(command):
+        arg_spec = ( ( "user_name", None, True, ),
+                     ( "password", None, False, ), )
+
+        def run(self):            
+            if self.user_name is None:
+                self.conn.wiki_user = self.ftp_frontend.ask(
+                    "Name", os.getenv("USER", None))
+            else:
+                self.conn.wiki_user = self.user_name
+            
+            if self.password is None:
+                print >> self.out, "331 Password required for %s." % (
+                    self.conn.wiki_user, )
+                self.conn.wiki_password = self.ftp_frontend.ask(
+                    "Password", no_echo=True)
+            else:
+                self.conn.wiki_password = self.password
+
+            print >> self.out, "230 Welcome to this Wiki!"
+            print >> self.out, "230 User %s logged in." % self.conn.wiki_user
+            print >> self.out, "Remote system type is UNIX."
+            print >> self.out, "Using binary mode to transfer files."
+        
+    
+    class close(command):
+        def run(self):
+            self.conn.close()            
+    clos = close
+    disconnect = close
+    disc = close
+
+    class cd(command):
+        """
+        Change dir is an intricate mechanism controling ftp_frontend.remote_path.
+        """
+        arg_spec = ( ("remote_directory", None, True,), )
+
+        def run(self):
+            if self.remote_directory.startswith("+") and \
+                    len(self.ftp_frontend.remote_path) > 1 and \
+                    self.ftp_frontend.remote_path[-1].startswith("+"):
+                print "550 %s: No such file or directory." % \
+                    self.remote_directory
+                return
+            
+            if self.remote_directory == ".":
+                return
+            elif self.remote_directory == "/":
+                self.ftp_frontend.remote_path = []
+            elif self.remote_directory == "..":
+                if len(self.ftp_frontend.remote_path) > 0:
+                    self.ftp_frontend.remote_path = \
+                        self.ftp_frontend.remote_path[:-1]
+            elif self.remote_directory.startswith("/"):
+                path = split(self.remote_directory, "/")
+                path = filter(lambda s: s != "", path)
+                self.ftp_frontend.remote_path = path
+            else:
+                self.ftp_frontend.remote_path += split(
+                    self.remote_directory, "/")
+
+            is_wiki = self.conn.check_for_wiki()
+            
+            print >> self.out, "250 CDW command successful."
+            
+            info = ( self.conn.host,
+                     join(self.ftp_frontend.remote_path, "/"), )
+            
+            if is_wiki:
+                print >> debug, self.ftp_frontend.remote_path
+                if len(self.ftp_frontend.remote_path) > 0:
+                    if self.ftp_frontend.remote_path[-1].endswith(".php"):
+                        # These things must be commented out, or
+                        # mediawikiftp stops working in emacs!
+                        #print >> self.out, "221 http://%s/%s is a wiki!" % info
+                        return
+                    elif len(self.ftp_frontend.remote_path) >= 2 and \
+                           self.ftp_frontend.remote_path[-1].startswith("+") and\
+                           self.ftp_frontend.remote_path[-2].endswith(".php"):
+                        msg = "221 http://%s/%s is a wiki, listing starts "+\
+                              "at %s!"
+                        print >> self.out, msg % ( self.conn.host,
+                                   join(self.ftp_frontend.remote_path, "/"),
+                                   repr(self.ftp_frontend.remote_path[-1][1:]), )
+                        return
+                # These things must be commented out, or
+                # mediawikiftp stops working in emacs!
+                #print >> self.out, "221 http://%s/%s may be a wiki, please specify its index.php using cd!" % info
+                return
+            
+            # These things must be commented out, or
+            # mediawikiftp stops working in emacs!
+            #print >> self.out, "221 http://%s/%s is not a wiki. Please cd to a wiki path including its index.php!"% info
+        
+
+    class pwd(command):
+        def run(self):
+            print >> self.out, '257 "%s" is the current directory.' % self.conn.basename()
+
+    class cdup(command):
+        def run(self):
+            if len(self.ftp_frontend.remote_path) > 0:
+                self.ftp_frontend.remote_path = self.ftp_frontend.remote_path[:-1]
+    
+    class dir(command):
+        arg_spec = ( ( "remote_path", None, False,),
+                     ( "local_file", None, False,), )
+
+        # Regex of links whoes title does not contain a :
+        link_to_page_re = re.compile(
+            r'<a href=".+?" title="([^:]+?)"')
+        
+        def run(self):
+            print >> debug, "Hallo"
+            
+            if len(self.ftp_frontend.remote_path) > 1 and \
+                    not self.ftp_frontend.remote_path[-1].startswith("-") and \
+                    self.ftp_frontend.remote_path != ".":
+                backup_remote_path = self.ftp_frontend.remote_path
+                # TODO: Set the remote path appropriately
+                # Emacs doesn't use this, but sends -la
+                # which makes ls list the current dir.
+            else:
+                backup_remote_path = None                
+
+            if self.conn.check_for_wiki(strict=True):
+                rp = self.ftp_frontend.remote_path # shorthand
+                
+                if len(rp) > 1 and rp[-1].startswith("+"):
+                    frm = rp[-1][1:]
+                    get_params = {"from": frm}
+                else:
+                    frm = None
+                    get_params = {}
+                    
+                    self.conn.login()
+                    response = self.conn.get("Special:AllPages", None,
+                                             **get_params)
+
+                    # Get the HTML
+                    html = response.read()
+
+                    print >> self.out, "229 Entering Extended Passive Mode (|||62405|)"
+                    print >> self.out, "150 Opening ASCII mode data connection for '/bin/ls'."
+                    
+                    if self.local_file is not None:
+                        out = open(self.local_file, "w")
+                    else:
+                        out = self.out
+                    
+                    for page_title in self.link_to_page_re.findall(html):
+                        print >> out, "-rw-r--r--    1 %s  users     0 Jan  1 00:00 %s" % ( self.conn.wiki_user, page_title, )
+
+                    if self.local_file is not None:
+                        out.close()
+                        
+                    print >> self.out, "226 Transfer complete."
+
+            elif self.conn.check_for_wiki(strict=False):
+                    print >> self.out, "229 Entering Extended Passive Mode (|||62405|)"
+                    print >> self.out, "150 Opening ASCII mode data connection for '/bin/ls'."
+                    print >> self.out, "drw-r--r--    1 %s  users     0 Jan  1 00:00 index.php" % ( self.conn.wiki_user, )
+                    print >> self.out, "226 Transfer complete."
+                
+                
+            else: # not a wiki
+                print >> self.out, "229 Entering Extended Passive Mode (|||62318|)"
+                print >> self.out, "150 Opening ASCII mode data connection for '/bin/ls'."
+                print >> self.out, "226 Transfer complete."
+                # These things must be commented out, or
+                # mediawikiftp stops working in emacs!
+                #print >> self.out, "221 Not in a wiki!"
+
+                
+            # Restore the old remote path if needed.
+            if backup_remote_path is not None:
+                self.ftp_frontend.remote_path = backup_remote_path
+        
+    ls = dir
+
+    class get(remote_file_command):
+        arg_spec = ( ("remote_file", None, True,),
+                     ("local_file", None, False,), )
+
+        def run(self):
+            if self.local_file is None:
+                self.local_file = self.remote_file
+                
+            out = open(self.local_file, "w")
+            
+            data = self.conn.get_article(self.remote_file)
+            
+            print >> self.out, "229 Entering Extended Passive Mode (|||62468|)"
+            print >> self.out, "150 Opening BINARY mode data connection for '%s' (%i bytes)." % ( self.remote_file, len(data), )
+            print >> self.out, "226 Transfer complete."
+            
+            out.write(data)
+            
+            out.close()
+
+    class put(remote_file_command):
+        arg_spec = ( ("local_file", None, True,),
+                     ("remote_file", None, False,), )
+
+        def run(self):
+            if self.remote_file is None:
+                self.remote_file = self.local_file
+                
+            data = open(self.local_file).read()
+
+            print >> self.out, "229 Entering Extended Passive Mode (|||62489|)"
+            print >> self.out, "150 Opening BINARY mode data connection for '%s'." % self.remote_file
+            self.conn.put_article(self.remote_file, data)
+            print >> self.out, "226 Transfer complete."
+            
+
+    class lcd(command):
+        arg_spec = ( ("directory", None, False,), )
+
+    class lpwd(command):
+        def run(self):
+            print os.cwd()
+        
+    
+    class ignore(command):
+        def run(self):
+            pass
+
+        def check_args(self):
+            return True
+
+    ascii = ignore
+    bell  = ignore
+    binary = ignore
+    image = ignore
+    chmod = ignore
+    delete = ignore
+    less = ignore
+    page = ignore
+
+    class type(command):
+        arg_spec = ( ("type", None, False,), )
+        
+        def run(self):
+            if self.type == "binary":
+                print "200 Type set to B."
+            else:
+                print "200 Type set to A."
+
+    class quot(command):
+        arg_spec = ( ("cmd", None, False,),
+                     ("arg", None, False,), )
+
+        def run(self):
+            if self.cmd == "mdtm":
+                print >> self.out, "213 19700101000000"
+    
+    
+## Main function
+def main(argv, doc):
+    parser = optparse.OptionParser(doc, version=__version__)
+    parser.add_option("--user", dest="wiki_user",
+                      help="Wiki user login name", default=None)
+    parser.add_option("--password", dest="wiki_password",
+                      help="Wiki user password", default=None)
+    parser.add_option("--http-user", help="HTTP (Basic AUTH) username",
+                      dest="http_user", default=None)
+    parser.add_option("--http-password", help="HTTP (Basic AUTH) password",
+                      dest="http_password", default=None)
+    parser.add_option("--proxy", help="HTTP proxy (and port, separated by :) The http_proxy environment variable is checked also.",
+                      dest="proxy_host", default=None)
+    parser.add_option("--proxy-user", help="Proxy username",
+                      dest="proxy_user", default=None)
+    parser.add_option("--proxy-password", help="Proxy password",
+                      dest="proxy_password", default=None)
+
+    parser.add_option("-i", help="Ignored.")
+    parser.add_option("-n", help="Ignored.")
+    parser.add_option("-g", help="Ignored.")
+    parser.add_option("-v", help="Ignored.")
+    
+    (options, args) = parser.parse_args()
+
+    # The hostname defaults to None, it is required in the open
+    # statement.
+    if len(args) > 0:
+        host = args[0]
+    else:
+        host = None
+
+    if len(args) > 1:
+        port = args[1]
+    else:
+        port = "21"
+
+    # TODO: Handly http_proxy environment variable if set.
+    optdict = {}
+    for a in dir(options):
+        if a[0] != "_" and a not in ("ensure_value", "read_file",
+                                     "read_module", "i", "n", "g", "v"):
+            optdict[a] = getattr(options, a)
+        
+    ftp_frontend(wiki_backend(host=host, port=port, **optdict)).run()
+
+if __name__ == "__main__":
+    main(sys.argv, __doc__)
